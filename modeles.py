@@ -1,3 +1,35 @@
+import csv
+from io import StringIO
+from math import isfinite
+
+from engine import Couche, Geometrie, cle, methode_vba, moyennes, poinconnement, positif, sans_accents, tassement
+
+COLONNES = [
+    "Modèle", "Couches", "Sondages associés", "Pl (MPa)", "Em (MPa)",
+    "α", "Épaisseurs (m)", "Hauteur maximale (m)", "Pl min (MPa)",
+]
+
+
+def vide(valeur):
+    return valeur is None or str(valeur).strip().lower() in ("", "nan", "<na>")
+
+
+def nombre(valeur):
+    if vide(valeur):
+        return None
+    try:
+        resultat = float(str(valeur).strip().replace(",", "."))
+    except ValueError as erreur:
+        raise ValueError(f"Valeur numérique invalide : {valeur}") from erreur
+    if not isfinite(resultat):
+        raise ValueError(f"Valeur numérique invalide : {valeur}")
+    return resultat
+
+
+def texte(valeur):
+    if vide(valeur):
+        return ""
+    if isinstance(valeur, float) and valeur.is_integer():
         return str(int(valeur))
     return str(valeur).strip()
 
