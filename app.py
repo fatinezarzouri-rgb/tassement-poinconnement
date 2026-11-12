@@ -1,108 +1,128 @@
-import io
+from hashlib import sha256
+from io import BytesIO
+
 import pandas as pd
 import streamlit as st
-import engine as E
 
-st.set_page_config(page_title="Tassement & poinçonnement", layout="wide")
-st.title("Calcul de tassement et de poinçonnement des remblais")
+from engine import lire_classeur
+from export_excel import exporter
+from modeles import (
+    COLONNES, POINCONNEMENT, SYNTHESE, calculer, depuis_classeur, groupes, lire_collage,
+)
 
-# ---------- Paramètres ----------
-with st.sidebar:
-    st.header("Remblai")
-    P = dict(
-        largeur=st.number_input("Largeur plateforme (m)", 1.0, 100.0, 13.0, 0.5),
-        pente=st.selectbox("Pente (H/V)", [1.0, 1.5, 2.0, 3.0], index=2),
-        surcharge=st.number_input("Surcharge q (kPa)", 0.0, 200.0, 30.0, 5.0),
-        gamma=st.number_input("Poids volumique (kN/m³)", 10.0, 30.0, 20.0, 0.5),
-        pas=st.number_input("Pas de calcul Δz (m)", 0.1, 2.0, 0.5, 0.1),
-        zmax=st.number_input("Profondeur max d'influence (m)", 5.0, 100.0, 28.0, 1.0),
+st.set_page_config(page_title="Tassement et poinçonnement", layout="wide")
+st.title("Tassement et poinçonnement des remblais")
+
+st.subheader("1. Essais pressiométriques")
+st.caption("Colonne A = famille · D = nom du sondage · I = Pl (MPa) · J = Em (MPa). Les données commencent à la ligne 3.")
+fichier = st.file_uploader("Importer le classeur Excel", type=["xlsx", "xlsm"])
+if not fichier:
+    st.info("Importe le classeur pour afficher les modèles et préparer l’export des résultats.")
+    st.stop()
+
+original = fichier.getvalue()
+identifiant = sha256(original).hexdigest()
+if st.session_state.get("source_id") != identifiant:
+    try:
+        essais, modeles, valeurs = lire_classeur(BytesIO(original))
+    except Exception as erreur:
+        st.error(f"Import impossible. {erreur}")
+        st.stop()
+    st.session_state.update(
+        source_id=identifiant, source_essais=essais, source_valeurs=valeurs,
+        table=depuis_classeur(modeles), version_table=0, resultat=None,
     )
-    st.header("Critères")
-    seuil = st.number_input("Écart toléré W avec/sans charge (cm)", 0.1, 10.0, 1.0, 0.1)
-    kp = st.number_input("kp (sols frottants)", 0.1, 2.0, 1.0, 0.05,
-                         help="Le classeur d'origine utilise kp = 1. À justifier selon le Fascicule 62 Titre V.")
-    fs_req = st.number_input("Coefficient de sécurité requis au poinçonnement", 1.0, 5.0, 2.0, 0.1)
 
-# ---------- 1. Essais pressiométriques ----------
-st.subheader("1. Essais pressiométriques (facultatif)")
-up = st.file_uploader("Classeur Excel des essais (1ère feuille, en-têtes ligne 2, colonnes A, D, I, J)",
-                      type=["xlsx", "xlsm"])
-essais = E.lire_essais(up) if up else None
-if essais is not None:
-    st.success(f"{len(essais)} essais lus.")
+essais = st.session_state.source_essais
+valeurs = st.session_state.source_valeurs
+st.success(f"{len(essais):,} lignes d’essais importées.".replace(",", " "))
 
-# ---------- 2. Modèles géotechniques ----------
+with st.sidebar:
+    st.header("Géométrie du remblai")
+    champs = [
+        ("largeur", "Largeur de plateforme (m)", 13.0, 0.01, 0.5),
+        ("pente", "Pente (H/V)", 2.0, 0.01, 0.1),
+        ("surcharge", "Surcharge (kPa)", 30.0, 0.0, 5.0),
+        ("gamma", "Poids volumique (kN/m³)", 20.0, 0.01, 0.5),
+        ("pas", "Pas des tranches (m)", 0.5, 0.001, 0.1),
+        ("zmax", "Profondeur maximale d’influence (m)", 28.0, 0.01, 1.0),
+    ]
+    p = {}
+    for nom, label, defaut, minimum, pas in champs:
+        valeur = valeurs.get(nom)
+        initial = float(valeur) if isinstance(valeur, (int, float)) and valeur >= minimum else defaut
+        p[nom] = st.number_input(label, min_value=minimum, value=initial, step=pas,
+                                 format="%.3f", key=f"{identifiant}_{nom}")
+    st.header("Critères de vérification")
+    seuil = st.number_input("Écart admissible (cm)", min_value=0.01, value=1.0, step=0.1)
+    fs_requis = st.number_input("Facteur de sécurité requis", min_value=0.01, value=2.0, step=0.1)
+    plafond = st.slider("Hauteur maximale de préchargement à tester (m)", 0.1, 10.0, 3.0, 0.1)
+    st.caption("Préchargement par paliers de 0,10 m. Kp = 1 pour les sables.")
+
 st.subheader("2. Modèles géotechniques")
-DEFAUT = pd.DataFrame([
-    [1, "q2m",  "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 1.546, 16.019, 1/3, 24.0, 8.97, 0.38],
-    [1, "q2mg", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 4.783, 90.118, 0.5, 6.0, 8.97, 0.0],
-    [2, "q2m",  "SP-OA-193+972, SP-PK193+950", 1.228, 11.967, 1/3, 6.0, 8.34, 0.95],
-    [2, "m",    "SP-OA-193+972, SP-PK193+950", 1.058, 8.839, 0.5, 6.8, 8.34, 0.0],
-], columns=["Modèle", "Couche", "Sondages", "Pl", "Em", "alpha", "Épaisseur", "H remblai", "Pl min"])
-if "table" not in st.session_state:
-    st.session_state.table = DEFAUT.copy()
-
-if essais is not None and st.button("Calculer Pl, Em, α et Pl min depuis les essais"):
-    t = st.session_state.table.copy()
-    for i, r in t.iterrows():
-        s = E.stats_essais(essais, r["Couche"], r["Sondages"])
-        if s:
-            t.loc[i, ["Pl", "Em"]] = [s["Pl"], s["Em"]]
-            a = E.alpha_menard(r["Couche"], s["EmPl"])
-            if a: t.loc[i, "alpha"] = a
-            t.loc[i, "Pl min"] = s["Plmin"]
+with st.expander("Coller un tableau depuis Excel"):
+    st.write("Sélectionne les colonnes A à H du tableau Modèle, puis colle-les ici. "
+             "Tu peux aussi inclure une 9ᵉ colonne pour Pl min. Les en-têtes sont acceptés.")
+    collage = st.text_area("Tableau Excel à coller", height=140, key=f"{identifiant}_collage")
+    if st.button("Importer le tableau collé"):
+        try:
+            lignes_collees = lire_collage(collage)
+            groupes(lignes_collees)
+        except ValueError as erreur:
+            st.error(str(erreur))
         else:
-            st.warning(f"Modèle {r['Modèle']} / {r['Couche']} : aucun essai trouvé.")
-    st.session_state.table = t
+            st.session_state.table = lignes_collees
+            st.session_state.version_table += 1
+            st.session_state.resultat = None
+            st.success("Tableau importé. Vérifie les couches avant de calculer.")
 
-table = st.data_editor(st.session_state.table, num_rows="dynamic", use_container_width=True, hide_index=True)
-st.caption("Une ligne par couche, dans l'ordre de la surface vers la profondeur. "
-           "« Pl min » n'est utilisé que pour la 1ʳᵉ couche (poinçonnement).")
+st.caption("Une ligne par couche, de la surface vers la profondeur. Pour les cellules fusionnées, "
+           "les valeurs du modèle, des sondages et de la hauteur sont reprises sur ses lignes suivantes.")
+df = pd.DataFrame(st.session_state.table, columns=COLONNES)
+for colonne in COLONNES[3:]:
+    df[colonne] = pd.to_numeric(df[colonne], errors="coerce").astype(float)
+table = st.data_editor(df, num_rows="dynamic", hide_index=True,
+                       column_config={"Modèle": st.column_config.TextColumn(),
+                                      "Couches": st.column_config.TextColumn(),
+                                      "Sondages associés": st.column_config.TextColumn(width="large")},
+                       key=f"{identifiant}_table_{st.session_state.version_table}")
+recalculer = st.checkbox("Recalculer Pl, Em, α et Pl min à partir des essais associés")
+st.caption("Au poinçonnement, seul le Pl min de la couche d’assise est utilisé. "
+           "S’il est vide, l’application le recherche dans les sondages associés.")
 
-# ---------- 3. Calcul ----------
-if st.button("Calculer", type="primary"):
-    synth, punch, details = [], [], {}
-    for m, g in table.dropna(subset=["Couche", "Em", "alpha", "Épaisseur"]).groupby("Modèle", sort=True):
-        couches = [dict(nom=r["Couche"], Em=r["Em"], alpha=r["alpha"], ep=r["Épaisseur"]) for _, r in g.iterrows()]
-        h = float(g["H remblai"].iloc[0])
-        w_avec, w_sans, det = E.tassement(h, 0, couches, P, detail=True)
-        ecart = w_avec - w_sans
-        pre = E.precharge(h, couches, P, seuil) if abs(ecart) > seuil else None
-        if abs(ecart) <= seuil:
-            spec = "conforme"
-        elif pre:
-            spec = f"préchargement hPre = {pre[0]:.2f} m"
-        else:
-            spec = "préchargement insuffisant (> 3 m) : revoir le projet"
-        synth.append({"Modèle": m, "W avec charge (cm)": round(w_avec, 2), "W sans charge (cm)": round(w_sans, 2),
-                      "Écart (cm)": round(ecart, 2), "Spécification": spec,
-                      "W avec/sans après préchargement (cm)": f"{pre[1]:.2f} / {pre[2]:.2f}" if pre else "—"})
-        first = g.iloc[0]
-        r = E.poinconnement(first["Couche"], first["Pl min"], h, first["Épaisseur"], P, kp)
-        punch.append({"Modèle": m, "Couche": first["Couche"], "Pl min (MPa)": first["Pl min"],
-                      "Méthode": r["methode"], "qapp (kPa)": round(r["qapp"], 1), "qmax (kPa)": round(r["qmax"], 1),
-                      "F = qmax/qapp": round(r["F"], 2),
-                      "Vérification": "OK" if r["F"] >= fs_req else "NON VÉRIFIÉ"})
-        details[m] = det
-    st.session_state.res = (pd.DataFrame(synth), pd.DataFrame(punch), details)
+lignes = list(table.itertuples(index=False, name=None))
+signature = (table.to_csv(index=False), tuple(p.items()), seuil, fs_requis, recalculer, plafond)
+if st.button("Calculer les modèles", type="primary"):
+    st.session_state.resultat = None
+    try:
+        modeles = groupes(lignes)
+        resultats = calculer(modeles, essais, p, seuil, fs_requis, recalculer, plafond)
+        sortie = exporter(original, modeles, resultats)
+    except Exception as erreur:
+        st.error(str(erreur))
+    else:
+        st.session_state.resultat = (signature, resultats, sortie)
 
-if "res" in st.session_state:
-    S, Pn, D = st.session_state.res
+stocke = st.session_state.resultat
+if stocke and stocke[0] != signature:
+    st.info("Les données ont changé. Relance le calcul pour actualiser les résultats.")
+if stocke and stocke[0] == signature:
+    _, resultats, sortie = stocke
     st.subheader("3. Résultats")
-    st.markdown("**Tassements**"); st.dataframe(S, use_container_width=True, hide_index=True)
-    st.markdown("**Poinçonnement (1ʳᵉ couche)**")
-    st.dataframe(Pn.style.map(lambda v: "color:#b00020;font-weight:bold" if v == "NON VÉRIFIÉ" else
-                                        "color:#1b7f3b" if v == "OK" else "", subset=["Vérification"]),
-                 use_container_width=True, hide_index=True)
-    for m, det in D.items():
-        with st.expander(f"Détail et courbe — modèle {m}"):
-            c = det.assign(Wcum_avec=det["W_avec"].cumsum(), Wcum_sans=det["W_sans"].cumsum()).set_index("z")
-            st.line_chart(c[["Wcum_avec", "Wcum_sans"]], x_label="z (m)", y_label="Tassement cumulé (cm)")
-            st.dataframe(det.round(4), use_container_width=True, hide_index=True)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        S.to_excel(xw, sheet_name="Synthese", index=False); Pn.to_excel(xw, sheet_name="Poinconnement", index=False)
-        pd.DataFrame([P]).T.rename(columns={0: "valeur"}).to_excel(xw, sheet_name="Hypotheses")
-        for m, det in D.items(): det.to_excel(xw, sheet_name=f"Modele {m}", index=False)
-    st.download_button("Télécharger les résultats (Excel)", buf.getvalue(), "resultats_tassement.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    synthese, poinconnement, detail = st.tabs(["Synthèse", "Poinçonnement", "Détail par modèle"])
+    with synthese:
+        st.dataframe(pd.DataFrame([r["synthese"] for r in resultats], columns=SYNTHESE).round(3), hide_index=True)
+    with poinconnement:
+        st.dataframe(pd.DataFrame([r["poinconnement"] for r in resultats], columns=POINCONNEMENT).round(3),
+                     hide_index=True)
+    with detail:
+        for r in resultats:
+            with st.expander(f"Modèle {r['modele']}"):
+                det = pd.DataFrame(r["detail"]).set_index("z (m)")
+                courbes = det[["ΔW avec surcharge (cm)", "ΔW référence (cm)"]].cumsum()
+                courbes.columns = ["Avec surcharge", "Sans surcharge"]
+                st.line_chart(courbes)
+                st.dataframe(det.round(6))
+                if r["pre"]:
+                    st.markdown(f"**Préchargement retenu : {r['synthese'][5]:.1f} m**")
+                    st.dataframe(pd.DataFrame(r["pre"][3]).round(6), hide_index=True)
