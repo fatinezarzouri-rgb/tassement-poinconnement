@@ -1,3 +1,67 @@
+"""Transcription des calculs du classeur de référence."""
+from bisect import bisect_left
+from dataclasses import dataclass
+from itertools import accumulate
+from math import atan, ceil, exp, isfinite, log, pi
+from unicodedata import normalize
+
+from openpyxl import load_workbook
+
+
+@dataclass(frozen=True)
+class Couche:
+    nom: str
+    epaisseur: float
+    em: float
+    alpha: float
+
+
+@dataclass(frozen=True)
+class Geometrie:
+    hauteur: float
+    largeur: float = 13
+    pente: float = 2
+    surcharge: float = 30
+    gamma: float = 20
+    pas: float = 0.5
+    zmax: float = 28
+
+
+def cle(valeur):
+    return str(valeur or "").strip().lower().replace(" ", "").replace("_", "")
+
+
+def sans_accents(valeur):
+    return normalize("NFKD", str(valeur or "")).encode("ascii", "ignore").decode()
+
+
+def positif(valeur):
+    try:
+        nombre = float(str(valeur).replace(",", "."))
+        return nombre if isfinite(nombre) and nombre > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def alpha_vba(famille, rapport):
+    nom = cle(sans_accents(famille))
+    if nom in ("argilesetlimonsettufs", "argilesetlimons", "argiles", "limonsettufs",
+               "argile", "limon", "q1l", "q2l", "marne", "marnes", "m", "mi"):
+        if rapport > 16:
+            return 1
+        if rapport >= 9:
+            return 2 / 3
+        if rapport >= 7 or nom in ("marne", "marnes", "m", "mi"):
+            return 0.5
+    if nom in ("sable", "sables", "q2m", "q2mg", "q2mm", "q2mgg", "2mgg"):
+        return 0.5 if rapport > 12 else 1 / 3
+    if nom in ("conglomerats", "conglomerat", "q1lc"):
+        return 1 / 3 if rapport > 10 else 1 / 4
+    if nom in ("gres", "gress", "schistessains", "schistesains", "schistesain",
+               "argilesetlimonsettufscompactes", "basaltes"):
+        return 0.5
+    if nom in ("schistesalteres", "schistealtere", "tresaltere"):
+        return 2 / 3
     return None
 
 
