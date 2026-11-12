@@ -1,140 +1,118 @@
-"""Moteur de calcul : tassement (Ménard + Osterberg), préchargement, poinçonnement."""
-import math, re, unicodedata
-import pandas as pd
-
-# ---------- Nettoyage des libellés ----------
-def norm(txt) -> str:
-    t = unicodedata.normalize("NFD", str(txt or ""))
-    t = "".join(c for c in t if unicodedata.category(c) != "Mn").lower()
-    return re.sub(r"[\s_\-]", "", t)
-
-# Table de synonymes -> famille canonique
-SYNONYMES = {
-    "argile": ["argilesetlimonsettufs", "argilesetlimons", "argiles", "argile", "limon",
-               "limonsettufs", "q1l", "q2l"],
-    "argile_compacte": ["argilesetlimonsettufscompactes"],
-    "marne": ["marne", "marnes", "m", "mi"],
-    "sable": ["sable", "sables", "q2m", "q2mg", "q2mm", "q2mgg", "2mgg"],
-    "conglomerat": ["conglomerats", "conglomerat", "q1lc"],
-    "gres": ["gres", "gress"],
-    "schiste_sain": ["schistessains", "schistesains", "schistesain", "schistesain"],
-    "schiste_altere": ["schistesaltères", "schistealtere", "schistesaltere", "tresaltere"],
-    "basalte": ["basaltes", "basalte"],
-}
-_LOOKUP = {norm(s): fam for fam, L in SYNONYMES.items() for s in L}
-
-# Fautes de frappe connues
-ALIAS = {"gress": "gres"}
-def canon(label) -> str:
-    n = norm(label)
-    return ALIAS.get(n, n)
-
-def famille(label) -> str:
-    return _LOOKUP.get(norm(label), "inconnu")
-
-# ---------- Coefficient rhéologique alpha (Ménard) ----------
-def alpha_menard(label, em_sur_pl):
-    f = famille(label)
-    try:
-        v = float(em_sur_pl)
-    except (TypeError, ValueError):
-        return None
-    if f == "argile":
-        return 1.0 if v > 16 else 2/3 if v >= 9 else 0.5 if v >= 7 else None
-    if f == "marne":
-        return 1.0 if v > 16 else 2/3 if v >= 9 else 0.5
-    if f == "sable":
-        return 0.5 if v > 12 else 1/3
-    if f == "conglomerat":
-        return 1/3 if v > 10 else 1/4
-    if f in ("gres", "schiste_sain", "argile_compacte", "basalte"):
-        return 0.5
-    if f == "schiste_altere":
-        return 2/3
     return None
 
-# ---------- Statistiques depuis les essais pressiométriques ----------
-def stats_essais(essais: pd.DataFrame, label, sondages: str):
-    """Pl : moyenne géométrique ; Em : moyenne harmonique ; Pl min."""
-    sond = {norm(s) for s in str(sondages).split(",") if s.strip()}
-    c = canon(label)
-    d = essais[(essais["famille"].map(canon) == c) & (essais["sondage"].map(norm).isin(sond))]
-    pl = pd.to_numeric(d["Pl"], errors="coerce"); pl = pl[pl > 0]
-    em = pd.to_numeric(d["Em"], errors="coerce"); em = em[em > 0]
-    if pl.empty or em.empty:
-        return None
-    pl_g = math.exp(sum(math.log(x) for x in pl) / len(pl))
-    em_h = len(em) / sum(1 / x for x in em)
-    return dict(Pl=round(pl_g, 3), Em=round(em_h, 3), EmPl=round(em_h / pl_g, 3), Plmin=float(pl.min()))
 
-def lire_essais(fichier) -> pd.DataFrame:
-    df = pd.read_excel(fichier, sheet_name=0, header=1)
-    cols = list(df.columns)
-    out = pd.DataFrame({"famille": df[cols[0]], "sondage": df[cols[3]],
-                        "Pl": df[cols[8]], "Em": df[cols[9]]})
-    return out.dropna(subset=["famille", "sondage"])
+def moyennes(essais, famille):
+    pl = [valeur for essai in essais if (valeur := positif(essai["Pl (MPa)"]))]
+    em = [valeur for essai in essais if (valeur := positif(essai["Em (MPa)"]))]
+    pl_moy = round(exp(sum(map(log, pl)) / len(pl)), 3) if pl else None
+    em_moy = round(len(em) / sum(1 / valeur for valeur in em), 3) if em else None
+    rapport = round(em_moy / pl_moy, 3) if pl_moy and em_moy else None
+    return pl_moy, em_moy, rapport, alpha_vba(famille, rapport) if rapport else None
 
-# ---------- Contraintes (Osterberg, sous l'axe du remblai) ----------
-def influence(z, a, b):
-    if z <= 0 or a <= 0 or b <= 0:
-        return 0.0
-    a1 = math.atan((a + b) / z) - math.atan(b / z)
-    a2 = math.atan(b / z)
-    return 2 / math.pi * (((a + b) / a) * (a1 + a2) - (b / a) * a2)
 
-def _couche_a(z, epaisseurs):
-    cum = 0
-    for i, e in enumerate(epaisseurs):
-        cum += e
-        if z <= cum + 1e-9:
-            return i
-    return len(epaisseurs) - 1
+def influence(profondeur, extension, demi_largeur):
+    angle_bord = atan(demi_largeur / profondeur)
+    angle_talus = atan((extension + demi_largeur) / profondeur)
+    return 2 / pi * ((extension + demi_largeur) / extension * angle_talus
+                     - demi_largeur / extension * angle_bord)
 
-def tassement(h, hpre, couches, p, detail=False):
-    """couches : liste de dict(nom, Em [MPa], alpha, ep [m])."""
-    b, dz, g = p["largeur"] / 2, p["pas"], p["gamma"]
-    eps = [c["ep"] for c in couches]
-    zmax = min(sum(eps), p["zmax"])
-    steps = math.ceil(zmax / dz - 1e-9)
-    h_eq = p["surcharge"] / g
-    rows, s_no, s_with = [], 0.0, 0.0
-    for k in range(1, steps + 1):
-        z = (k - 0.5) * dz
-        c = couches[_couche_a(z, eps)]
-        i_no = influence(z, p["pente"] * (h + hpre), b)
-        i_w = influence(z, p["pente"] * (h + h_eq), b)
-        ds_no, ds_w = g * (h + hpre) * i_no, g * (h + h_eq) * i_w
-        w_no = c["alpha"] * ds_no * dz / (c["Em"] * 1000) * 100
-        w_w = c["alpha"] * ds_w * dz / (c["Em"] * 1000) * 100
-        s_no += w_no; s_with += w_w
-        rows.append(dict(couche=c["nom"], z=z, I_sans=i_no, I_avec=i_w, Em=c["Em"],
-                         alpha=c["alpha"], dsig_sans=ds_no, dsig_avec=ds_w,
-                         W_avec=w_w, W_sans=w_no))
-    return (s_with, s_no, pd.DataFrame(rows)) if detail else (s_with, s_no)
 
-def precharge(h, couches, p, seuil=1.0, hmax=3.0, pas=0.05):
-    """Plus petit hPre tel que |W avec - W sans| <= seuil (cm)."""
-    n = int(round(hmax / pas))
-    for i in range(1, n + 1):
-        hp = round(i * pas, 4)
-        w_avec, w_sans = tassement(h, hp, couches, p)
-        if abs(w_avec - w_sans) <= seuil:
-            return hp, w_avec, w_sans
+def tassement(geo, couches, prechargement=0):
+    if not all(positif(x) for x in (geo.hauteur, geo.largeur, geo.pente, geo.gamma, geo.pas, geo.zmax)):
+        raise ValueError("Hauteur, largeur, pente, poids volumique et pas doivent être positifs.")
+    if any(not isfinite(x) or x < 0 for x in (geo.surcharge, prechargement)):
+        raise ValueError("La surcharge et la hauteur de préchargement doivent être positives ou nulles.")
+    if not couches or any(not all(positif(x) for x in (c.epaisseur, c.em, c.alpha)) for c in couches):
+        raise ValueError("Chaque couche doit avoir une épaisseur, un Em et un α positifs.")
+    limites = list(accumulate(c.epaisseur for c in couches))
+    profondeur_max = min(limites[-1], geo.zmax)
+    if geo.pas < profondeur_max / 20000:
+        raise ValueError("Le pas de calcul produit plus de 20 000 tranches.")
+    hauteurs = (geo.hauteur + geo.surcharge / geo.gamma, geo.hauteur + prechargement)
+    detail = []
+    for k in range(ceil(profondeur_max / geo.pas)):
+        z = (k + 0.5) * geo.pas
+        couche = couches[min(bisect_left(limites, z - 1e-9), len(couches) - 1)]
+        facteurs = [influence(z, geo.pente * h, geo.largeur / 2) for h in hauteurs]
+        charges = [geo.gamma * h * facteur for h, facteur in zip(hauteurs, facteurs)]
+        avec, ref = [couche.alpha * q * geo.pas / (couche.em * 10) for q in charges]
+        detail.append({
+            "Couche": couche.nom, "z (m)": z, "Em (MPa)": couche.em, "α": couche.alpha,
+            "I avec surcharge": facteurs[0], "I référence": facteurs[1],
+            "Δσ avec surcharge (kPa)": charges[0], "Δσ référence (kPa)": charges[1],
+            "ΔW avec surcharge (cm)": avec, "ΔW référence (cm)": ref,
+        })
+    avec = sum(r["ΔW avec surcharge (cm)"] for r in detail)
+    ref = sum(r["ΔW référence (cm)"] for r in detail)
+    return avec, ref, avec - ref, detail
+
+
+def methode_vba(famille):
+    nom = cle(sans_accents(famille))
+    if nom == "m" or any(m in nom for m in ("argile", "limon", "tuf", "marne", "q2l", "q1l", "mi")):
+        return "Sols mous"
+    if any(m in nom for m in ("sable", "q2m", "schiste", "conglomerat", "gres", "basalte", "q1lc")):
+        return "Sols frottants"
     return None
 
-# ---------- Poinçonnement ----------
-def poinconnement(label, plmin, h, ep, p, kp=1.0):
-    """plmin en MPa, h = hauteur de remblai (m), ep = épaisseur de la couche (m)."""
-    qapp = h * p["gamma"] + p["surcharge"]
-    f = famille(label)
-    if plmin <= 0 or f == "inconnu":
-        return dict(methode="Inconnu", qapp=qapp, qmax=0.0, F=0.0)
-    if f in ("argile", "marne", "argile_compacte"):
-        B = p["largeur"] + p["pente"] * h
-        r = B / ep
-        nc = math.pi + 2 if r <= 1.5 else 0.468 * r + 4.445 if r <= 10 else 9.125
-        cu = 21 * (plmin * 10) ** 0.75
-        qmax, meth = nc * cu, "Sols mous"
+
+def poinconnement(geo, epaisseur, pl_min, methode):
+    q_app = geo.gamma * geo.hauteur + geo.surcharge
+    if methode == "Sols mous":
+        rapport = (geo.largeur + geo.pente * geo.hauteur) / epaisseur
+        if rapport <= 1.5:
+            nc = pi + 2
+        elif rapport <= 10:
+            nc = 0.468 * rapport + 4.445
+        else:
+            nc = 9.125
+        q_max = nc * 21 * (pl_min * 10) ** 0.75
+    elif methode == "Sols frottants":
+        q_max = pl_min * 1000
     else:
-        qmax, meth = kp * plmin * 1000, "Sols frottants"
-    return dict(methode=meth, qapp=qapp, qmax=qmax, F=qmax / qapp if qapp > 0 else 0.0)
+        raise ValueError("Sélectionne la méthode de poinçonnement.")
+    return q_app, q_max, q_max / q_app
+
+
+def feuille_essais(classeur):
+    return next((s for s in classeur if "essaispressiom" in cle(sans_accents(s.title))), None)
+
+
+def lire_classeur(fichier):
+    classeur = load_workbook(fichier, read_only=True, data_only=True)
+    try:
+        feuille = feuille_essais(classeur)
+        if feuille is None:
+            raise ValueError("La feuille des essais pressiométriques est introuvable.")
+        essais = []
+        for ligne, r in enumerate(feuille.iter_rows(min_row=3, max_col=10, values_only=True), 3):
+            if r[0] and r[3]:
+                essais.append({
+                    "Ligne Excel": ligne, "Famille": str(r[0]).strip(), "Ouvrage": str(r[1] or ""),
+                    "PK": r[2], "Sondage": str(r[3]).strip(), "Début (m)": r[5], "Fin (m)": r[6],
+                    "Lithologie": r[7], "Pl (MPa)": positif(r[8]), "Em (MPa)": positif(r[9]),
+                })
+        modeles = {}
+        if "plem" in classeur or "Modèle" in classeur:
+            ancienne_structure = "plem" in classeur
+            feuille_modele = classeur["plem" if ancienne_structure else "Modèle"]
+            modele = None
+            for r in feuille_modele.iter_rows(min_row=2, max_col=9, values_only=True):
+                epaisseur, hauteur = (r[7], r[8]) if ancienne_structure else (r[6], r[7])
+                if r[0] is not None:
+                    modele = str(r[0])
+                    modeles[modele] = {"hauteur": positif(hauteur), "couches": []}
+                if modele and r[1]:
+                    couches = modeles[modele]["couches"]
+                    sondages = str(r[2]).split(",") if r[2] else (couches[-1]["sondages"] if couches else [])
+                    couches.append({"nom": str(r[1]).strip(), "sondages": [s.strip() for s in sondages],
+                                    "epaisseur": positif(epaisseur), "pl": positif(r[3]), "em": positif(r[4]), "alpha": positif(r[6] if ancienne_structure else r[5])})
+        geometrie = {}
+        nom_synthese = next((s.title for s in classeur if cle(sans_accents(s.title)) == "synthese"), None)
+        if nom_synthese:
+            valeurs = classeur[nom_synthese].iter_rows(min_row=2, max_row=7, min_col=24, max_col=24, values_only=True)
+            geometrie = dict(zip(("largeur", "pente", "surcharge", "gamma", "pas", "zmax"), (v[0] for v in valeurs)))
+            geometrie = {nom: valeur for nom, valeur in geometrie.items() if valeur is not None}
+        return essais, modeles, geometrie
+    finally:
+        classeur.close()
