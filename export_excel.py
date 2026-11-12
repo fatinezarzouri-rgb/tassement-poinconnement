@@ -1,3 +1,99 @@
+from io import BytesIO
+import re
+
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from PIL import Image, ImageDraw, ImageFont
+
+from engine import cle, feuille_essais, sans_accents
+from modeles import COLONNES, POINCONNEMENT, SYNTHESE
+
+TRAIT = Side(style="thin", color="94A3B8")
+BORDURE = Border(left=TRAIT, right=TRAIT, top=TRAIT, bottom=TRAIT)
+BLEU = "1D4E78"
+COUCHES = ("FDF0A5", "F9CEDD", "CEE8E5", "DBE6F8")
+
+
+def tableau(feuille, entetes, lignes, debut=1, largeurs=None, formats=None):
+    formats = formats or {}
+    for i, valeurs in enumerate([entetes, *lignes], debut):
+        for j, valeur in enumerate(valeurs, 1):
+            cellule = feuille.cell(i, j, valeur)
+            if isinstance(valeur, str):
+                cellule.data_type = "s"
+            cellule.border = BORDURE
+            cellule.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if i == debut:
+                cellule.fill = PatternFill("solid", fgColor=BLEU)
+                cellule.font = Font(bold=True, color="FFFFFF")
+            elif isinstance(valeur, (int, float)):
+                cellule.number_format = formats.get(j, "0.000")
+        feuille.row_dimensions[i].height = 32 if i == debut else 19
+    for i, largeur in enumerate(largeurs or [20] * len(entetes), 1):
+        feuille.column_dimensions[get_column_letter(i)].width = largeur
+    feuille.freeze_panes = f"B{debut + 1}"
+    feuille.sheet_view.showGridLines = False
+    feuille.print_options.horizontalCentered = True
+
+
+def fusionner(feuille, colonne, debut, fin, couleur=None):
+    if fin > debut:
+        feuille.merge_cells(start_row=debut, start_column=colonne, end_row=fin, end_column=colonne)
+    cellule = feuille.cell(debut, colonne)
+    cellule.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cellule.font = Font(bold=True, color="173451")
+    if couleur:
+        cellule.fill = PatternFill("solid", fgColor=couleur)
+
+
+def schema(geo, hpre):
+    image = Image.new("RGB", (920, 210), "white")
+    d = ImageDraw.Draw(image)
+    police = ImageFont.load_default(size=16)
+    encre = "#173451"
+    centre, base = 460, 157
+    haut_total = geo.hauteur + (hpre or 0)
+    largeur_totale = geo.largeur + 2 * geo.pente * haut_total
+    echelle = min(680 / largeur_totale, 80 / haut_total)
+    demi = geo.largeur / 2 * echelle
+    pied = largeur_totale / 2 * echelle
+    sommet = base - geo.hauteur * echelle
+    sommet_pre = base - haut_total * echelle
+    pied_sans = demi + geo.pente * geo.hauteur * echelle
+    if hpre:
+        d.polygon([(centre - pied, base), (centre - demi, sommet_pre),
+                   (centre + demi, sommet_pre), (centre + pied, base)],
+                  fill="#B7D5EA", outline="#1D4E78", width=2)
+    d.polygon([(centre - pied_sans, base), (centre - demi, sommet),
+               (centre + demi, sommet), (centre + pied_sans, base)],
+              fill="#CDB890", outline="#705939", width=2)
+    d.line((70, base, 850, base), fill=encre, width=2)
+    for k in range(1, 8 if geo.surcharge else 1):
+        x = centre - demi + k * 2 * demi / 8
+        d.line((x, sommet_pre - 23, x, sommet_pre - 3), fill="#" + BLEU, width=2)
+        d.polygon([(x - 3, sommet_pre - 8), (x + 3, sommet_pre - 8), (x, sommet_pre - 2)], fill="#" + BLEU)
+    d.text((centre, 28), f"Plateforme : {geo.largeur:g} m     |     q = {geo.surcharge:g} kPa",
+           fill=encre, font=police, anchor="mm")
+    texte = f"H = {geo.hauteur:g} m     |     Pente = {geo.pente:g} H / 1 V"
+    if hpre:
+        texte += f"     |     hPre = {hpre:.1f} m (bleu)"
+    d.text((centre, 182), texte, fill=encre, font=police, anchor="mm")
+    flux = BytesIO()
+    image.save(flux, format="PNG")
+    flux.seek(0)
+    return ExcelImage(flux)
+
+
+def nouvelle_feuille(classeur, nom):
+    nom = re.sub(r"[\\/:?*\[\]]", "_", nom)[:31]
+    base = nom
+    compteur = 2
+    while nom.lower() in {n.lower() for n in classeur.sheetnames}:
+        suffixe = f" ({compteur})"
+        nom = base[:31 - len(suffixe)] + suffixe
+        compteur += 1
     return classeur.create_sheet(nom)
 
 
