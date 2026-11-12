@@ -1,27 +1,3 @@
-from hashlib import sha256
-from io import BytesIO
-
-import pandas as pd
-import streamlit as st
-
-from engine import lire_classeur
-from export_excel import exporter
-from modeles import (
-    COLONNES, POINCONNEMENT, SYNTHESE, calculer, depuis_classeur, groupes, lire_collage,
-)
-
-st.set_page_config(page_title="Tassement et poinçonnement", layout="wide")
-st.title("Tassement et poinçonnement des remblais")
-
-st.subheader("1. Essais pressiométriques")
-st.caption("Colonne A = famille · D = nom du sondage · I = Pl (MPa) · J = Em (MPa). Les données commencent à la ligne 3.")
-fichier = st.file_uploader("Importer le classeur Excel", type=["xlsx", "xlsm"])
-if not fichier:
-    st.info("Importe le classeur pour afficher les modèles et préparer l’export des résultats.")
-    st.stop()
-
-original = fichier.getvalue()
-identifiant = sha256(original).hexdigest()
 if st.session_state.get("source_id") != identifiant:
     try:
         essais, modeles, valeurs = lire_classeur(BytesIO(original))
@@ -126,3 +102,6 @@ if stocke and stocke[0] == signature:
                 if r["pre"]:
                     st.markdown(f"**Préchargement retenu : {r['synthese'][5]:.1f} m**")
                     st.dataframe(pd.DataFrame(r["pre"][3]).round(6), hide_index=True)
+    st.download_button("Télécharger le classeur Excel de résultats", sortie,
+                       "resultats_tassement.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
