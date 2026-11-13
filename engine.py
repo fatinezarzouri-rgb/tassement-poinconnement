@@ -1,108 +1,140 @@
-import io
+"""Moteur de calcul : tassement (Ménard + Osterberg), préchargement, poinçonnement."""
+import math, re, unicodedata
 import pandas as pd
-import streamlit as st
-import engine as E
 
-st.set_page_config(page_title="Tassement & poinçonnement", layout="wide")
-st.title("Calcul de tassement et de poinçonnement des remblais")
+# ---------- Nettoyage des libellés ----------
+def norm(txt) -> str:
+    t = unicodedata.normalize("NFD", str(txt or ""))
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn").lower()
+    return re.sub(r"[\s_\-]", "", t)
 
-# ---------- Paramètres ----------
-with st.sidebar:
-    st.header("Remblai")
-    P = dict(
-        largeur=st.number_input("Largeur plateforme (m)", 1.0, 100.0, 13.0, 0.5),
-        pente=st.selectbox("Pente (H/V)", [1.0, 1.5, 2.0, 3.0], index=2),
-        surcharge=st.number_input("Surcharge q (kPa)", 0.0, 200.0, 30.0, 5.0),
-        gamma=st.number_input("Poids volumique (kN/m³)", 10.0, 30.0, 20.0, 0.5),
-        pas=st.number_input("Pas de calcul Δz (m)", 0.1, 2.0, 0.5, 0.1),
-        zmax=st.number_input("Profondeur max d'influence (m)", 5.0, 100.0, 28.0, 1.0),
-    )
-    st.header("Critères")
-    seuil = st.number_input("Écart toléré W avec/sans charge (cm)", 0.1, 10.0, 1.0, 0.1)
-    kp = st.number_input("kp (sols frottants)", 0.1, 2.0, 1.0, 0.05,
-                         help="Le classeur d'origine utilise kp = 1. À justifier selon le Fascicule 62 Titre V.")
-    fs_req = st.number_input("Coefficient de sécurité requis au poinçonnement", 1.0, 5.0, 2.0, 0.1)
+# Table de synonymes -> famille canonique
+SYNONYMES = {
+    "argile": ["argilesetlimonsettufs", "argilesetlimons", "argiles", "argile", "limon",
+               "limonsettufs", "q1l", "q2l"],
+    "argile_compacte": ["argilesetlimonsettufscompactes"],
+    "marne": ["marne", "marnes", "m", "mi"],
+    "sable": ["sable", "sables", "q2m", "q2mg", "q2mm", "q2mgg", "2mgg"],
+    "conglomerat": ["conglomerats", "conglomerat", "q1lc"],
+    "gres": ["gres", "gress"],
+    "schiste_sain": ["schistessains", "schistesains", "schistesain", "schistesain"],
+    "schiste_altere": ["schistesaltères", "schistealtere", "schistesaltere", "tresaltere"],
+    "basalte": ["basaltes", "basalte"],
+}
+_LOOKUP = {norm(s): fam for fam, L in SYNONYMES.items() for s in L}
 
-# ---------- 1. Essais pressiométriques ----------
-st.subheader("1. Essais pressiométriques (facultatif)")
-up = st.file_uploader("Classeur Excel des essais (1ère feuille, en-têtes ligne 2, colonnes A, D, I, J)",
-                      type=["xlsx", "xlsm"])
-essais = E.lire_essais(up) if up else None
-if essais is not None:
-    st.success(f"{len(essais)} essais lus.")
+# Fautes de frappe connues
+ALIAS = {"gress": "gres"}
+def canon(label) -> str:
+    n = norm(label)
+    return ALIAS.get(n, n)
 
-# ---------- 2. Modèles géotechniques ----------
-st.subheader("2. Modèles géotechniques")
-DEFAUT = pd.DataFrame([
-    [1, "q2m",  "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 1.546, 16.019, 1/3, 24.0, 8.97, 0.38],
-    [1, "q2mg", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 4.783, 90.118, 0.5, 6.0, 8.97, 0.0],
-    [2, "q2m",  "SP-OA-193+972, SP-PK193+950", 1.228, 11.967, 1/3, 6.0, 8.34, 0.95],
-    [2, "m",    "SP-OA-193+972, SP-PK193+950", 1.058, 8.839, 0.5, 6.8, 8.34, 0.0],
-], columns=["Modèle", "Couche", "Sondages", "Pl", "Em", "alpha", "Épaisseur", "H remblai", "Pl min"])
-if "table" not in st.session_state:
-    st.session_state.table = DEFAUT.copy()
+def famille(label) -> str:
+    return _LOOKUP.get(norm(label), "inconnu")
 
-if essais is not None and st.button("Calculer Pl, Em, α et Pl min depuis les essais"):
-    t = st.session_state.table.copy()
-    for i, r in t.iterrows():
-        s = E.stats_essais(essais, r["Couche"], r["Sondages"])
-        if s:
-            t.loc[i, ["Pl", "Em"]] = [s["Pl"], s["Em"]]
-            a = E.alpha_menard(r["Couche"], s["EmPl"])
-            if a: t.loc[i, "alpha"] = a
-            t.loc[i, "Pl min"] = s["Plmin"]
-        else:
-            st.warning(f"Modèle {r['Modèle']} / {r['Couche']} : aucun essai trouvé.")
-    st.session_state.table = t
+# ---------- Coefficient rhéologique alpha (Ménard) ----------
+def alpha_menard(label, em_sur_pl):
+    f = famille(label)
+    try:
+        v = float(em_sur_pl)
+    except (TypeError, ValueError):
+        return None
+    if f == "argile":
+        return 1.0 if v > 16 else 2/3 if v >= 9 else 0.5 if v >= 7 else None
+    if f == "marne":
+        return 1.0 if v > 16 else 2/3 if v >= 9 else 0.5
+    if f == "sable":
+        return 0.5 if v > 12 else 1/3
+    if f == "conglomerat":
+        return 1/3 if v > 10 else 1/4
+    if f in ("gres", "schiste_sain", "argile_compacte", "basalte"):
+        return 0.5
+    if f == "schiste_altere":
+        return 2/3
+    return None
 
-table = st.data_editor(st.session_state.table, num_rows="dynamic", use_container_width=True, hide_index=True)
-st.caption("Une ligne par couche, dans l'ordre de la surface vers la profondeur. "
-           "« Pl min » n'est utilisé que pour la 1ʳᵉ couche (poinçonnement).")
+# ---------- Statistiques depuis les essais pressiométriques ----------
+def stats_essais(essais: pd.DataFrame, label, sondages: str):
+    """Pl : moyenne géométrique ; Em : moyenne harmonique ; Pl min."""
+    sond = {norm(s) for s in str(sondages).split(",") if s.strip()}
+    c = canon(label)
+    d = essais[(essais["famille"].map(canon) == c) & (essais["sondage"].map(norm).isin(sond))]
+    pl = pd.to_numeric(d["Pl"], errors="coerce"); pl = pl[pl > 0]
+    em = pd.to_numeric(d["Em"], errors="coerce"); em = em[em > 0]
+    if pl.empty or em.empty:
+        return None
+    pl_g = math.exp(sum(math.log(x) for x in pl) / len(pl))
+    em_h = len(em) / sum(1 / x for x in em)
+    return dict(Pl=round(pl_g, 3), Em=round(em_h, 3), EmPl=round(em_h / pl_g, 3), Plmin=float(pl.min()))
 
-# ---------- 3. Calcul ----------
-if st.button("Calculer", type="primary"):
-    synth, punch, details = [], [], {}
-    for m, g in table.dropna(subset=["Couche", "Em", "alpha", "Épaisseur"]).groupby("Modèle", sort=True):
-        couches = [dict(nom=r["Couche"], Em=r["Em"], alpha=r["alpha"], ep=r["Épaisseur"]) for _, r in g.iterrows()]
-        h = float(g["H remblai"].iloc[0])
-        w_avec, w_sans, det = E.tassement(h, 0, couches, P, detail=True)
-        ecart = w_avec - w_sans
-        pre = E.precharge(h, couches, P, seuil) if abs(ecart) > seuil else None
-        if abs(ecart) <= seuil:
-            spec = "conforme"
-        elif pre:
-            spec = f"préchargement hPre = {pre[0]:.2f} m"
-        else:
-            spec = "préchargement insuffisant (> 3 m) : revoir le projet"
-        synth.append({"Modèle": m, "W avec charge (cm)": round(w_avec, 2), "W sans charge (cm)": round(w_sans, 2),
-                      "Écart (cm)": round(ecart, 2), "Spécification": spec,
-                      "W avec/sans après préchargement (cm)": f"{pre[1]:.2f} / {pre[2]:.2f}" if pre else "—"})
-        first = g.iloc[0]
-        r = E.poinconnement(first["Couche"], first["Pl min"], h, first["Épaisseur"], P, kp)
-        punch.append({"Modèle": m, "Couche": first["Couche"], "Pl min (MPa)": first["Pl min"],
-                      "Méthode": r["methode"], "qapp (kPa)": round(r["qapp"], 1), "qmax (kPa)": round(r["qmax"], 1),
-                      "F = qmax/qapp": round(r["F"], 2),
-                      "Vérification": "OK" if r["F"] >= fs_req else "NON VÉRIFIÉ"})
-        details[m] = det
-    st.session_state.res = (pd.DataFrame(synth), pd.DataFrame(punch), details)
+def lire_essais(fichier) -> pd.DataFrame:
+    df = pd.read_excel(fichier, sheet_name=0, header=1)
+    cols = list(df.columns)
+    out = pd.DataFrame({"famille": df[cols[0]], "sondage": df[cols[3]],
+                        "Pl": df[cols[8]], "Em": df[cols[9]]})
+    return out.dropna(subset=["famille", "sondage"])
 
-if "res" in st.session_state:
-    S, Pn, D = st.session_state.res
-    st.subheader("3. Résultats")
-    st.markdown("**Tassements**"); st.dataframe(S, use_container_width=True, hide_index=True)
-    st.markdown("**Poinçonnement (1ʳᵉ couche)**")
-    st.dataframe(Pn.style.map(lambda v: "color:#b00020;font-weight:bold" if v == "NON VÉRIFIÉ" else
-                                        "color:#1b7f3b" if v == "OK" else "", subset=["Vérification"]),
-                 use_container_width=True, hide_index=True)
-    for m, det in D.items():
-        with st.expander(f"Détail et courbe — modèle {m}"):
-            c = det.assign(Wcum_avec=det["W_avec"].cumsum(), Wcum_sans=det["W_sans"].cumsum()).set_index("z")
-            st.line_chart(c[["Wcum_avec", "Wcum_sans"]], x_label="z (m)", y_label="Tassement cumulé (cm)")
-            st.dataframe(det.round(4), use_container_width=True, hide_index=True)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        S.to_excel(xw, sheet_name="Synthese", index=False); Pn.to_excel(xw, sheet_name="Poinconnement", index=False)
-        pd.DataFrame([P]).T.rename(columns={0: "valeur"}).to_excel(xw, sheet_name="Hypotheses")
-        for m, det in D.items(): det.to_excel(xw, sheet_name=f"Modele {m}", index=False)
-    st.download_button("Télécharger les résultats (Excel)", buf.getvalue(), "resultats_tassement.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+# ---------- Contraintes (Osterberg, sous l'axe du remblai) ----------
+def influence(z, a, b):
+    if z <= 0 or a <= 0 or b <= 0:
+        return 0.0
+    a1 = math.atan((a + b) / z) - math.atan(b / z)
+    a2 = math.atan(b / z)
+    return 2 / math.pi * (((a + b) / a) * (a1 + a2) - (b / a) * a2)
+
+def _couche_a(z, epaisseurs):
+    cum = 0
+    for i, e in enumerate(epaisseurs):
+        cum += e
+        if z <= cum + 1e-9:
+            return i
+    return len(epaisseurs) - 1
+
+def tassement(h, hpre, couches, p, detail=False):
+    """couches : liste de dict(nom, Em [MPa], alpha, ep [m])."""
+    b, dz, g = p["largeur"] / 2, p["pas"], p["gamma"]
+    eps = [c["ep"] for c in couches]
+    zmax = min(sum(eps), p["zmax"])
+    steps = math.ceil(zmax / dz - 1e-9)
+    h_eq = p["surcharge"] / g
+    rows, s_no, s_with = [], 0.0, 0.0
+    for k in range(1, steps + 1):
+        z = (k - 0.5) * dz
+        c = couches[_couche_a(z, eps)]
+        i_no = influence(z, p["pente"] * (h + hpre), b)
+        i_w = influence(z, p["pente"] * (h + h_eq), b)
+        ds_no, ds_w = g * (h + hpre) * i_no, g * (h + h_eq) * i_w
+        w_no = c["alpha"] * ds_no * dz / (c["Em"] * 1000) * 100
+        w_w = c["alpha"] * ds_w * dz / (c["Em"] * 1000) * 100
+        s_no += w_no; s_with += w_w
+        rows.append(dict(couche=c["nom"], z=z, I_sans=i_no, I_avec=i_w, Em=c["Em"],
+                         alpha=c["alpha"], dsig_sans=ds_no, dsig_avec=ds_w,
+                         W_avec=w_w, W_sans=w_no))
+    return (s_with, s_no, pd.DataFrame(rows)) if detail else (s_with, s_no)
+
+def precharge(h, couches, p, seuil=1.0, hmax=3.0, pas=0.05):
+    """Plus petit hPre tel que |W avec - W sans| <= seuil (cm)."""
+    n = int(round(hmax / pas))
+    for i in range(1, n + 1):
+        hp = round(i * pas, 4)
+        w_avec, w_sans = tassement(h, hp, couches, p)
+        if abs(w_avec - w_sans) <= seuil:
+            return hp, w_avec, w_sans
+    return None
+
+# ---------- Poinçonnement ----------
+def poinconnement(label, plmin, h, ep, p, kp=1.0):
+    """plmin en MPa, h = hauteur de remblai (m), ep = épaisseur de la couche (m)."""
+    qapp = h * p["gamma"] + p["surcharge"]
+    f = famille(label)
+    if plmin <= 0 or f == "inconnu":
+        return dict(methode="Inconnu", qapp=qapp, qmax=0.0, F=0.0)
+    if f in ("argile", "marne", "argile_compacte"):
+        B = p["largeur"] + p["pente"] * h
+        r = B / ep
+        nc = math.pi + 2 if r <= 1.5 else 0.468 * r + 4.445 if r <= 10 else 9.125
+        cu = 21 * (plmin * 10) ** 0.75
+        qmax, meth = nc * cu, "Sols mous"
+    else:
+        qmax, meth = kp * plmin * 1000, "Sols frottants"
+    return dict(methode=meth, qapp=qapp, qmax=qmax, F=qmax / qapp if qapp > 0 else 0.0)
