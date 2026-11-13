@@ -47,57 +47,46 @@ if up is not None:
  
 # ---------- 2. Modèles géotechniques ----------
 st.subheader("2. Modèles géotechniques")
-DEFAUT = pd.DataFrame([
-    [1, "q2m", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 1.546, 16.019, 1 / 3, 24.0, 8.97],
-    [1, "q2mg", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 4.783, 90.118, 0.5, 6.0, 8.97],
-    [2, "q2m", "SP-OA-193+972, SP-PK193+950", 1.228, 11.967, 1 / 3, 6.0, 8.34],
-    [2, "m", "SP-OA-193+972, SP-PK193+950", 1.058, 8.839, 0.5, 6.8, 8.34],
-], columns=X.COLONNES)
-if "table" not in st.session_state:
-    st.session_state.table = DEFAUT.copy()
+st.markdown(
+    "Entrez un tableau avec les colonnes **dans cet ordre** : "
+    "**Modèle | Couches | Sondages associés | Épaisseurs (m) | Hauteur maximal (m)**. "
+    "Pl, Em et α sont calculés automatiquement à partir des essais quand vous cliquez sur "
+    "« Charger le tableau ».")
+SAISIE_DEFAUT = pd.DataFrame([
+    [1, "q2m", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 24.0, 8.97],
+    [1, "q2mg", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 6.0, 8.97],
+    [2, "q2m", "SP-OA-193+972, SP-PK193+950", 6.0, 8.34],
+    [2, "m", "SP-OA-193+972, SP-PK193+950", 6.8, 8.34],
+], columns=X.COLONNES_SAISIE)
  
-st.markdown("**Coller depuis Excel** : sélectionnez votre tableau dans Excel (avec ou sans la ligne "
-            "d'en-têtes, les cellules fusionnées sont acceptées), copiez avec Ctrl+C, collez dans la "
-            "case ci-dessous avec Ctrl+V, puis cliquez sur « Charger ». "
-            "Colonnes attendues : " + " | ".join(X.COLONNES) + ".")
-collage = st.text_area("Tableau collé depuis Excel", height=140, label_visibility="collapsed")
-if st.button("Charger le tableau collé"):
-    try:
-        st.session_state.table = X.parse_modeles(collage)
-        ok = True
-    except Exception as e:
-        ok = False
-        st.error(f"Collage impossible : {e}")
-    if ok:
-        st.rerun()
+collage = st.text_area(
+    "Option : coller le tableau depuis Excel (Ctrl+C dans Excel, Ctrl+V ici ; les cellules fusionnées "
+    "sont acceptées). Si cette case est vide, le tableau ci-dessous est utilisé.", height=120)
+saisie = st.data_editor(SAISIE_DEFAUT, num_rows="dynamic", use_container_width=True, hide_index=True)
  
-if essais is not None and st.button("Recalculer Pl, Em et α depuis les essais"):
-    t = st.session_state.table.copy()
-    for i, r in t.iterrows():
-        s = E.stats_essais(essais, r["Couches"], r["Sondages associés"])
-        if s:
-            t.loc[i, ["Pl", "Em"]] = [s["Pl"], s["Em"]]
-            a = E.alpha_menard(r["Couches"], s["EmPl"])
-            if a:
-                t.loc[i, "α"] = a
-        else:
-            st.warning(f"Modèle {r['Modèle']} / {r['Couches']} : aucun essai trouvé.")
-    st.session_state.table = t
-    st.rerun()
- 
-table = st.data_editor(st.session_state.table, num_rows="dynamic",
-                       use_container_width=True, hide_index=True)
-st.caption("Une ligne par couche, de la surface vers la profondeur. Vous pouvez aussi modifier "
-           "les cellules directement ici.")
+if st.button("Charger le tableau"):
+    if essais is None:
+        st.error("Chargez d'abord le classeur des essais (étape 1) : Pl, Em et α en sont déduits.")
+    else:
+        try:
+            base = X.parse_modeles(collage) if collage.strip() else saisie
+            tab, avert = X.completer_modeles(base, essais)
+            st.session_state.table = tab
+            st.session_state.pop("res", None)
+            for a in avert:
+                st.warning(a)
+        except Exception as e:
+            st.error(f"Chargement impossible : {e}")
  
 # ---------- 3. Calcul ----------
-if st.button("Calculer", type="primary"):
-    if essais is None:
-        st.error("Chargez d'abord le classeur des essais (étape 1) : il sert au Pl min du poinçonnement.")
-    else:
+if "table" in st.session_state:
+    st.markdown("**Tableau des modèles, avec Pl, Em et α calculés** (modifiable si besoin)")
+    table = st.data_editor(st.session_state.table, num_rows="dynamic",
+                           use_container_width=True, hide_index=True)
+    if st.button("Calculer", type="primary"):
         modeles, punch, avert = X.calculer_tout(table, essais, P, seuil, fs_req)
         if not modeles:
-            st.error("Aucun modèle complet dans le tableau.")
+            st.error("Aucun modèle complet dans le tableau (Pl, Em, α, épaisseur et hauteur sont nécessaires).")
         else:
             for a in avert:
                 st.warning(a)
