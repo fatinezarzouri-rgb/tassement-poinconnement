@@ -1,118 +1,108 @@
-    return None
+import io
+import pandas as pd
+import streamlit as st
+import engine as E
 
+st.set_page_config(page_title="Tassement & poinçonnement", layout="wide")
+st.title("Calcul de tassement et de poinçonnement des remblais")
 
-def moyennes(essais, famille):
-    pl = [valeur for essai in essais if (valeur := positif(essai["Pl (MPa)"]))]
-    em = [valeur for essai in essais if (valeur := positif(essai["Em (MPa)"]))]
-    pl_moy = round(exp(sum(map(log, pl)) / len(pl)), 3) if pl else None
-    em_moy = round(len(em) / sum(1 / valeur for valeur in em), 3) if em else None
-    rapport = round(em_moy / pl_moy, 3) if pl_moy and em_moy else None
-    return pl_moy, em_moy, rapport, alpha_vba(famille, rapport) if rapport else None
+# ---------- Paramètres ----------
+with st.sidebar:
+    st.header("Remblai")
+    P = dict(
+        largeur=st.number_input("Largeur plateforme (m)", 1.0, 100.0, 13.0, 0.5),
+        pente=st.selectbox("Pente (H/V)", [1.0, 1.5, 2.0, 3.0], index=2),
+        surcharge=st.number_input("Surcharge q (kPa)", 0.0, 200.0, 30.0, 5.0),
+        gamma=st.number_input("Poids volumique (kN/m³)", 10.0, 30.0, 20.0, 0.5),
+        pas=st.number_input("Pas de calcul Δz (m)", 0.1, 2.0, 0.5, 0.1),
+        zmax=st.number_input("Profondeur max d'influence (m)", 5.0, 100.0, 28.0, 1.0),
+    )
+    st.header("Critères")
+    seuil = st.number_input("Écart toléré W avec/sans charge (cm)", 0.1, 10.0, 1.0, 0.1)
+    kp = st.number_input("kp (sols frottants)", 0.1, 2.0, 1.0, 0.05,
+                         help="Le classeur d'origine utilise kp = 1. À justifier selon le Fascicule 62 Titre V.")
+    fs_req = st.number_input("Coefficient de sécurité requis au poinçonnement", 1.0, 5.0, 2.0, 0.1)
 
+# ---------- 1. Essais pressiométriques ----------
+st.subheader("1. Essais pressiométriques (facultatif)")
+up = st.file_uploader("Classeur Excel des essais (1ère feuille, en-têtes ligne 2, colonnes A, D, I, J)",
+                      type=["xlsx", "xlsm"])
+essais = E.lire_essais(up) if up else None
+if essais is not None:
+    st.success(f"{len(essais)} essais lus.")
 
-def influence(profondeur, extension, demi_largeur):
-    angle_bord = atan(demi_largeur / profondeur)
-    angle_talus = atan((extension + demi_largeur) / profondeur)
-    return 2 / pi * ((extension + demi_largeur) / extension * angle_talus
-                     - demi_largeur / extension * angle_bord)
+# ---------- 2. Modèles géotechniques ----------
+st.subheader("2. Modèles géotechniques")
+DEFAUT = pd.DataFrame([
+    [1, "q2m",  "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 1.546, 16.019, 1/3, 24.0, 8.97, 0.38],
+    [1, "q2mg", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 4.783, 90.118, 0.5, 6.0, 8.97, 0.0],
+    [2, "q2m",  "SP-OA-193+972, SP-PK193+950", 1.228, 11.967, 1/3, 6.0, 8.34, 0.95],
+    [2, "m",    "SP-OA-193+972, SP-PK193+950", 1.058, 8.839, 0.5, 6.8, 8.34, 0.0],
+], columns=["Modèle", "Couche", "Sondages", "Pl", "Em", "alpha", "Épaisseur", "H remblai", "Pl min"])
+if "table" not in st.session_state:
+    st.session_state.table = DEFAUT.copy()
 
-
-def tassement(geo, couches, prechargement=0):
-    if not all(positif(x) for x in (geo.hauteur, geo.largeur, geo.pente, geo.gamma, geo.pas, geo.zmax)):
-        raise ValueError("Hauteur, largeur, pente, poids volumique et pas doivent être positifs.")
-    if any(not isfinite(x) or x < 0 for x in (geo.surcharge, prechargement)):
-        raise ValueError("La surcharge et la hauteur de préchargement doivent être positives ou nulles.")
-    if not couches or any(not all(positif(x) for x in (c.epaisseur, c.em, c.alpha)) for c in couches):
-        raise ValueError("Chaque couche doit avoir une épaisseur, un Em et un α positifs.")
-    limites = list(accumulate(c.epaisseur for c in couches))
-    profondeur_max = min(limites[-1], geo.zmax)
-    if geo.pas < profondeur_max / 20000:
-        raise ValueError("Le pas de calcul produit plus de 20 000 tranches.")
-    hauteurs = (geo.hauteur + geo.surcharge / geo.gamma, geo.hauteur + prechargement)
-    detail = []
-    for k in range(ceil(profondeur_max / geo.pas)):
-        z = (k + 0.5) * geo.pas
-        couche = couches[min(bisect_left(limites, z - 1e-9), len(couches) - 1)]
-        facteurs = [influence(z, geo.pente * h, geo.largeur / 2) for h in hauteurs]
-        charges = [geo.gamma * h * facteur for h, facteur in zip(hauteurs, facteurs)]
-        avec, ref = [couche.alpha * q * geo.pas / (couche.em * 10) for q in charges]
-        detail.append({
-            "Couche": couche.nom, "z (m)": z, "Em (MPa)": couche.em, "α": couche.alpha,
-            "I avec surcharge": facteurs[0], "I référence": facteurs[1],
-            "Δσ avec surcharge (kPa)": charges[0], "Δσ référence (kPa)": charges[1],
-            "ΔW avec surcharge (cm)": avec, "ΔW référence (cm)": ref,
-        })
-    avec = sum(r["ΔW avec surcharge (cm)"] for r in detail)
-    ref = sum(r["ΔW référence (cm)"] for r in detail)
-    return avec, ref, avec - ref, detail
-
-
-def methode_vba(famille):
-    nom = cle(sans_accents(famille))
-    if nom == "m" or any(m in nom for m in ("argile", "limon", "tuf", "marne", "q2l", "q1l", "mi")):
-        return "Sols mous"
-    if any(m in nom for m in ("sable", "q2m", "schiste", "conglomerat", "gres", "basalte", "q1lc")):
-        return "Sols frottants"
-    return None
-
-
-def poinconnement(geo, epaisseur, pl_min, methode):
-    q_app = geo.gamma * geo.hauteur + geo.surcharge
-    if methode == "Sols mous":
-        rapport = (geo.largeur + geo.pente * geo.hauteur) / epaisseur
-        if rapport <= 1.5:
-            nc = pi + 2
-        elif rapport <= 10:
-            nc = 0.468 * rapport + 4.445
+if essais is not None and st.button("Calculer Pl, Em, α et Pl min depuis les essais"):
+    t = st.session_state.table.copy()
+    for i, r in t.iterrows():
+        s = E.stats_essais(essais, r["Couche"], r["Sondages"])
+        if s:
+            t.loc[i, ["Pl", "Em"]] = [s["Pl"], s["Em"]]
+            a = E.alpha_menard(r["Couche"], s["EmPl"])
+            if a: t.loc[i, "alpha"] = a
+            t.loc[i, "Pl min"] = s["Plmin"]
         else:
-            nc = 9.125
-        q_max = nc * 21 * (pl_min * 10) ** 0.75
-    elif methode == "Sols frottants":
-        q_max = pl_min * 1000
-    else:
-        raise ValueError("Sélectionne la méthode de poinçonnement.")
-    return q_app, q_max, q_max / q_app
+            st.warning(f"Modèle {r['Modèle']} / {r['Couche']} : aucun essai trouvé.")
+    st.session_state.table = t
 
+table = st.data_editor(st.session_state.table, num_rows="dynamic", use_container_width=True, hide_index=True)
+st.caption("Une ligne par couche, dans l'ordre de la surface vers la profondeur. "
+           "« Pl min » n'est utilisé que pour la 1ʳᵉ couche (poinçonnement).")
 
-def feuille_essais(classeur):
-    return next((s for s in classeur if "essaispressiom" in cle(sans_accents(s.title))), None)
+# ---------- 3. Calcul ----------
+if st.button("Calculer", type="primary"):
+    synth, punch, details = [], [], {}
+    for m, g in table.dropna(subset=["Couche", "Em", "alpha", "Épaisseur"]).groupby("Modèle", sort=True):
+        couches = [dict(nom=r["Couche"], Em=r["Em"], alpha=r["alpha"], ep=r["Épaisseur"]) for _, r in g.iterrows()]
+        h = float(g["H remblai"].iloc[0])
+        w_avec, w_sans, det = E.tassement(h, 0, couches, P, detail=True)
+        ecart = w_avec - w_sans
+        pre = E.precharge(h, couches, P, seuil) if abs(ecart) > seuil else None
+        if abs(ecart) <= seuil:
+            spec = "conforme"
+        elif pre:
+            spec = f"préchargement hPre = {pre[0]:.2f} m"
+        else:
+            spec = "préchargement insuffisant (> 3 m) : revoir le projet"
+        synth.append({"Modèle": m, "W avec charge (cm)": round(w_avec, 2), "W sans charge (cm)": round(w_sans, 2),
+                      "Écart (cm)": round(ecart, 2), "Spécification": spec,
+                      "W avec/sans après préchargement (cm)": f"{pre[1]:.2f} / {pre[2]:.2f}" if pre else "—"})
+        first = g.iloc[0]
+        r = E.poinconnement(first["Couche"], first["Pl min"], h, first["Épaisseur"], P, kp)
+        punch.append({"Modèle": m, "Couche": first["Couche"], "Pl min (MPa)": first["Pl min"],
+                      "Méthode": r["methode"], "qapp (kPa)": round(r["qapp"], 1), "qmax (kPa)": round(r["qmax"], 1),
+                      "F = qmax/qapp": round(r["F"], 2),
+                      "Vérification": "OK" if r["F"] >= fs_req else "NON VÉRIFIÉ"})
+        details[m] = det
+    st.session_state.res = (pd.DataFrame(synth), pd.DataFrame(punch), details)
 
-
-def lire_classeur(fichier):
-    classeur = load_workbook(fichier, read_only=True, data_only=True)
-    try:
-        feuille = feuille_essais(classeur)
-        if feuille is None:
-            raise ValueError("La feuille des essais pressiométriques est introuvable.")
-        essais = []
-        for ligne, r in enumerate(feuille.iter_rows(min_row=3, max_col=10, values_only=True), 3):
-            if r[0] and r[3]:
-                essais.append({
-                    "Ligne Excel": ligne, "Famille": str(r[0]).strip(), "Ouvrage": str(r[1] or ""),
-                    "PK": r[2], "Sondage": str(r[3]).strip(), "Début (m)": r[5], "Fin (m)": r[6],
-                    "Lithologie": r[7], "Pl (MPa)": positif(r[8]), "Em (MPa)": positif(r[9]),
-                })
-        modeles = {}
-        if "plem" in classeur or "Modèle" in classeur:
-            ancienne_structure = "plem" in classeur
-            feuille_modele = classeur["plem" if ancienne_structure else "Modèle"]
-            modele = None
-            for r in feuille_modele.iter_rows(min_row=2, max_col=9, values_only=True):
-                epaisseur, hauteur = (r[7], r[8]) if ancienne_structure else (r[6], r[7])
-                if r[0] is not None:
-                    modele = str(r[0])
-                    modeles[modele] = {"hauteur": positif(hauteur), "couches": []}
-                if modele and r[1]:
-                    couches = modeles[modele]["couches"]
-                    sondages = str(r[2]).split(",") if r[2] else (couches[-1]["sondages"] if couches else [])
-                    couches.append({"nom": str(r[1]).strip(), "sondages": [s.strip() for s in sondages],
-                                    "epaisseur": positif(epaisseur), "pl": positif(r[3]), "em": positif(r[4]), "alpha": positif(r[6] if ancienne_structure else r[5])})
-        geometrie = {}
-        nom_synthese = next((s.title for s in classeur if cle(sans_accents(s.title)) == "synthese"), None)
-        if nom_synthese:
-            valeurs = classeur[nom_synthese].iter_rows(min_row=2, max_row=7, min_col=24, max_col=24, values_only=True)
-            geometrie = dict(zip(("largeur", "pente", "surcharge", "gamma", "pas", "zmax"), (v[0] for v in valeurs)))
-            geometrie = {nom: valeur for nom, valeur in geometrie.items() if valeur is not None}
-        return essais, modeles, geometrie
-    finally:
-        classeur.close()
+if "res" in st.session_state:
+    S, Pn, D = st.session_state.res
+    st.subheader("3. Résultats")
+    st.markdown("**Tassements**"); st.dataframe(S, use_container_width=True, hide_index=True)
+    st.markdown("**Poinçonnement (1ʳᵉ couche)**")
+    st.dataframe(Pn.style.map(lambda v: "color:#b00020;font-weight:bold" if v == "NON VÉRIFIÉ" else
+                                        "color:#1b7f3b" if v == "OK" else "", subset=["Vérification"]),
+                 use_container_width=True, hide_index=True)
+    for m, det in D.items():
+        with st.expander(f"Détail et courbe — modèle {m}"):
+            c = det.assign(Wcum_avec=det["W_avec"].cumsum(), Wcum_sans=det["W_sans"].cumsum()).set_index("z")
+            st.line_chart(c[["Wcum_avec", "Wcum_sans"]], x_label="z (m)", y_label="Tassement cumulé (cm)")
+            st.dataframe(det.round(4), use_container_width=True, hide_index=True)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        S.to_excel(xw, sheet_name="Synthese", index=False); Pn.to_excel(xw, sheet_name="Poinconnement", index=False)
+        pd.DataFrame([P]).T.rename(columns={0: "valeur"}).to_excel(xw, sheet_name="Hypotheses")
+        for m, det in D.items(): det.to_excel(xw, sheet_name=f"Modele {m}", index=False)
+    st.download_button("Télécharger les résultats (Excel)", buf.getvalue(), "resultats_tassement.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
