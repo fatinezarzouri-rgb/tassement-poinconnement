@@ -20,9 +20,7 @@ with st.sidebar:
     )
     st.header("Critères")
     seuil = st.number_input("Écart toléré W avec/sans charge (cm)", 0.1, 10.0, 1.0, 0.1)
-    fs_req = st.number_input("Coefficient de sécurité requis au poinçonnement", 1.0, 5.0, 2.0, 0.1)
-    st.caption("Poinçonnement : kp = 1 pour les sols frottants (sable). "
-               "Préchargement testé par pas de 0,1 m : 0,1 / 0,2 / 0,3 ...")
+    fs_req = st.number_input("Coefficient de sécurité requis au poinçonnement", 1.0, 5.0, 1.5, 0.1)
  
  
 @st.cache_data(show_spinner="Lecture des essais...")
