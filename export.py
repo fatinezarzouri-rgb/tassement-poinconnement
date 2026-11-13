@@ -12,6 +12,7 @@ import engine as E
  
 COLONNES = ["Modèle", "Couches", "Sondages associés", "Pl", "Em", "α",
             "Épaisseurs (m)", "Hauteur maximal (m)"]
+COLONNES_SAISIE = ["Modèle", "Couches", "Sondages associés", "Épaisseurs (m)", "Hauteur maximal (m)"]
  
  
 # ====================== Lecture des essais ======================
@@ -42,24 +43,61 @@ def _num(s):
  
  
 def parse_modeles(text: str) -> pd.DataFrame:
-    """Tableau copié depuis Excel (avec ou sans en-têtes, cellules fusionnées acceptées)."""
+    """Tableau copié depuis Excel : Modèle | Couches | Sondages associés | Épaisseurs (m) |
+    Hauteur maximal (m). Avec ou sans en-têtes ; cellules fusionnées acceptées.
+    (L'ancien tableau à 8 colonnes est aussi accepté : Pl, Em et α sont alors ignorés.)"""
     df = pd.read_csv(io.StringIO(text), sep="\t", header=None, dtype=str,
                      keep_default_na=False, skip_blank_lines=True)
-    if df.shape[1] < 8:
-        raise ValueError(f"{df.shape[1]} colonne(s) trouvée(s), il en faut 8 : " + ", ".join(COLONNES))
-    df = df.iloc[:, :8]
-    df.columns = COLONNES
+    n = df.shape[1]
+    if n >= 8:
+        df = df.iloc[:, [0, 1, 2, 6, 7]]
+    elif n >= 5:
+        df = df.iloc[:, :5]
+    else:
+        raise ValueError(f"{n} colonne(s) trouvée(s), il en faut 5 : " + " | ".join(COLONNES_SAISIE))
+    df.columns = COLONNES_SAISIE
     df = df.apply(lambda c: c.str.strip()).replace("", np.nan)
     if np.isnan(_num(df.iloc[0, 0])):          # 1re ligne = en-têtes
         df = df.iloc[1:]
     for c in ["Modèle", "Sondages associés", "Hauteur maximal (m)"]:   # colonnes fusionnées
         df[c] = df[c].ffill()
     df["Sondages associés"] = df["Sondages associés"].str.replace(r"\s+", " ", regex=True)
-    for c in ["Modèle", "Pl", "Em", "α", "Épaisseurs (m)", "Hauteur maximal (m)"]:
+    for c in ["Modèle", "Épaisseurs (m)", "Hauteur maximal (m)"]:
         df[c] = df[c].map(_num)
     df = df.dropna(subset=["Couches", "Modèle"]).reset_index(drop=True)
     df["Modèle"] = df["Modèle"].round().astype(int)
     return df
+ 
+ 
+def completer_modeles(saisie, essais):
+    """Ajoute Pl (moyenne géométrique), Em (moyenne harmonique) et α depuis les essais.
+    Retourne (tableau à 8 colonnes, avertissements)."""
+    t = saisie.copy().replace("", np.nan).dropna(how="all")
+    t["Modèle"] = pd.to_numeric(t["Modèle"], errors="coerce").ffill()
+    t = t.dropna(subset=["Modèle", "Couches"])
+    t["Modèle"] = t["Modèle"].round().astype(int)
+    for c in ["Sondages associés", "Hauteur maximal (m)"]:
+        t[c] = t.groupby("Modèle")[c].transform("first")
+    for c in ["Épaisseurs (m)", "Hauteur maximal (m)"]:
+        t[c] = t[c].map(_num)
+    lignes, avert = [], []
+    for _, r in t.iterrows():
+        s = E.stats_essais(essais, r["Couches"], r["Sondages associés"])
+        pl = em = al = float("nan")
+        if s is None:
+            avert.append(f"Modèle {r['Modèle']} / {r['Couches']} : aucun essai trouvé "
+                         f"dans les sondages « {r['Sondages associés']} ».")
+        else:
+            pl, em = s["Pl"], s["Em"]
+            a = E.alpha_menard(r["Couches"], s["EmPl"])
+            if a is None:
+                avert.append(f"Modèle {r['Modèle']} / {r['Couches']} : α non défini "
+                             f"(famille inconnue ou Em/Pl = {s['EmPl']} hors barème).")
+            else:
+                al = a
+        lignes.append([r["Modèle"], r["Couches"], r["Sondages associés"], pl, em, al,
+                       r["Épaisseurs (m)"], r["Hauteur maximal (m)"]])
+    return pd.DataFrame(lignes, columns=COLONNES), avert
  
  
 # ====================== Schéma du remblai ======================
