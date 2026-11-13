@@ -48,29 +48,22 @@ if up is not None:
 # ---------- 2. Modèles géotechniques ----------
 st.subheader("2. Modèles géotechniques")
 st.markdown(
-    "Entrez un tableau avec les colonnes **dans cet ordre** : "
+    "Dans Excel, sélectionnez votre tableau avec les colonnes **dans cet ordre** : "
     "**Modèle | Couches | Sondages associés | Épaisseurs (m) | Hauteur maximal (m)**. "
-    "Pl, Em et α sont calculés automatiquement à partir des essais quand vous cliquez sur "
-    "« Charger le tableau ».")
-SAISIE_DEFAUT = pd.DataFrame([
-    [1, "q2m", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 24.0, 8.97],
-    [1, "q2mg", "SP-PRA1922-01+PZ, SCP1_APD_COM+PZ", 6.0, 8.97],
-    [2, "q2m", "SP-OA-193+972, SP-PK193+950", 6.0, 8.34],
-    [2, "m", "SP-OA-193+972, SP-PK193+950", 6.8, 8.34],
-], columns=X.COLONNES_SAISIE)
- 
-collage = st.text_area(
-    "Option : coller le tableau depuis Excel (Ctrl+C dans Excel, Ctrl+V ici ; les cellules fusionnées "
-    "sont acceptées). Si cette case est vide, le tableau ci-dessous est utilisé.", height=120)
-saisie = st.data_editor(SAISIE_DEFAUT, num_rows="dynamic", use_container_width=True, hide_index=True)
+    "Copiez avec Ctrl+C, collez dans la case ci-dessous avec Ctrl+V (les cellules fusionnées sont "
+    "acceptées), puis cliquez sur « Charger le tableau ». Pl, Em et α sont calculés automatiquement "
+    "à partir des essais.")
+collage = st.text_area("Coller le tableau depuis Excel", height=160,
+                       placeholder="Modèle\tCouches\tSondages associés\tÉpaisseurs (m)\tHauteur maximal (m)")
  
 if st.button("Charger le tableau"):
     if essais is None:
         st.error("Chargez d'abord le classeur des essais (étape 1) : Pl, Em et α en sont déduits.")
+    elif not collage.strip():
+        st.error("Collez d'abord le tableau dans la case ci-dessus.")
     else:
         try:
-            base = X.parse_modeles(collage) if collage.strip() else saisie
-            tab, avert = X.completer_modeles(base, essais)
+            tab, avert = X.completer_modeles(X.parse_modeles(collage), essais)
             st.session_state.table = tab
             st.session_state.pop("res", None)
             for a in avert:
